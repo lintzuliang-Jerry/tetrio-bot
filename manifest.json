@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "TETR.IO AI Bot",
+  "version": "0.1.0",
+  "description": "AI bot for TETR.IO Zen mode (研究/學習用途)",
+  "permissions": ["activeTab", "scripting"],
+  "host_permissions": ["https://tetr.io/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://tetr.io/*"],
+      "js": ["content-script.js"],
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["https://tetr.io/*"],
+      "js": ["game-hook.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  }
+}
