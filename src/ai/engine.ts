@@ -34,9 +34,12 @@ function holdPenalty(
   currentHold: PieceType | null,
   pieceBeingHeld: PieceType,
 ): number {
-  if (currentHold === null) return 2;
-  if (pieceBeingHeld === 'I') return 15;
-  return 3;
+  // Scaled up to match the evaluator's score magnitude (often 50-200).
+  // The old 2/3/15 values were dominated by even tiny placement differences,
+  // so the AI thrashed between hold and no-hold.
+  if (currentHold === null) return 8;
+  if (pieceBeingHeld === 'I') return 60;
+  return 12;
 }
 
 function expand(

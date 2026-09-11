@@ -8,20 +8,26 @@ import {
   SURVIVAL_LINE_BONUS,
 } from '@/types';
 
-/** Balanced profile: our tuned 14-feature evaluation. */
+/**
+ * Balanced profile: stability-tuned weights.
+ *
+ * Compared to prior weights, this version pushes harder on hole avoidance,
+ * landing height, and well preservation, and dampens the 3-line bonus so the
+ * AI doesn't sacrifice the I-piece well for a triple.
+ */
 export const DEFAULT_WEIGHTS: EvaluationWeights = {
-  landingHeight: -2.7,
+  landingHeight: -4.5,
   rowTransitions: -3.2,
   columnTransitions: -9.3,
-  holes: -15.0,
+  holes: -22.0,
   wellSum: -3.5,
-  bumpiness: -1.2,
-  aggregateHeight: -0.5,
-  holeDepth: -5.0,
-  wellGuard: -10.0,
+  bumpiness: -1.4,
+  aggregateHeight: -0.8,
+  holeDepth: -8.0,
+  wellGuard: -15.0,
   b2bBonus: 12.0,
   comboBonus: 2.0,
-  lineClearBonus: [8, 20, 40, 80],
+  lineClearBonus: [8, 20, 25, 80],
 };
 
 /**

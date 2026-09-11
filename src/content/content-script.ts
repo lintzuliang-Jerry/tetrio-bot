@@ -1,64 +1,44 @@
 /**
  * Content Script — runs in tetr.io page (isolated world).
  *
- * Responsibilities:
- * 1. Inject the game-hook script into the page's main world
- * 2. Receive game state from game-hook via postMessage
- * 3. Run AI engine to find best placement
- * 4. Send move commands back to game-hook (main world) for execution
- * 5. Communicate with popup/background via chrome.runtime messages
+ * v5 changes vs prior:
+ *   - The board from game-hook is already locked-only (active piece stripped),
+ *     so we drop the old cleanRawBoard / ghost-stripping logic.
+ *   - currentPiece carries the REAL detected (x, rotation, y), not an assumed
+ *     spawn. Move sequence is computed from there.
+ *   - canHold comes from the game-hook tracker (real availability), not a
+ *     hardcoded `true`.
+ *   - We wait for MOVES_COMPLETE.verified before advancing the acted counter.
+ *     Unverified moves cause us to skip a tick and re-read the board.
  */
 
-import { GameState, AIDecision, Board, WeightProfile, BOARD_HEIGHT_BUFFER, BOARD_TOTAL_HEIGHT, BOARD_WIDTH } from '@/types';
+import {
+  GameState,
+  AIDecision,
+  WeightProfile,
+  BOARD_HEIGHT_BUFFER,
+  BOARD_TOTAL_HEIGHT,
+} from '@/types';
 import { findBestPlacement } from '@/ai/engine';
 import { calculateMoveSequence } from '@/controller/input';
-import { getShape } from '@/ai/piece';
 import { getWeightProfile } from '@/ai/evaluator';
-
-// ===== Board Cleaning =====
-
-/**
- * Remove active piece cells from the raw board at the known spawn position.
- * The game-hook sends the raw board (including active piece + ghost), so we
- * subtract the piece at spawn (rotation=0, standard x, y=4) before sending to AI.
- */
-function cleanRawBoard(board: Board, pieceType: string, spawnX: number, spawnY: number): Board {
-  const shape = getShape(pieceType as import('@/types').PieceType, 0);
-  // Deep copy the board so we don't mutate the original
-  const cleaned: Board = board.map(row => [...row]);
-  for (const [dr, dc] of shape) {
-    const r = spawnY + dr;
-    const c = spawnX + dc;
-    if (r >= 0 && r < BOARD_TOTAL_HEIGHT && c >= 0 && c < BOARD_WIDTH) {
-      // Only clear cells that match the piece type (don't clear locked cells of other types)
-      if (cleaned[r][c] === pieceType || cleaned[r][c] !== null) {
-        // If the cell matches the active piece type at spawn location, clear it.
-        // Also clear any cell at spawn position since the active piece always renders there.
-        cleaned[r][c] = null;
-      }
-    }
-  }
-  return cleaned;
-}
 
 // ===== Bot State =====
 
 let isRunning = false;
 let lastState: GameState | null = null;
 let isExecutingMove = false;
-/** Monotonic piece counter from game-hook, avoids acting on same piece twice */
 let lastActedPieceCounter = -1;
+let consecutiveUnverified = 0;
+
 let stats = {
   piecesPlaced: 0,
-  linesCleared: 0,
   startTime: 0,
 };
 
-/** AI strength — controls beam search width. */
 type AiStrength = 'fast' | 'balanced' | 'strong';
 let aiStrength: AiStrength = 'strong';
 
-/** Weight profile — controls evaluation function. */
 let weightProfile: WeightProfile = 'balanced';
 
 function strengthBeamWidth(s: AiStrength): number {
@@ -67,63 +47,45 @@ function strengthBeamWidth(s: AiStrength): number {
   return 50;
 }
 
-/** Speed preset — controls keyDelay and MIN_ACTION_INTERVAL together. */
-type SpeedPreset = 'safe' | 'fast' | 'turbo';
+type SpeedPreset = 'safe' | 'fast';
 let speedPreset: SpeedPreset = 'fast';
-
-/** ms between key presses. */
 let keyDelay = 16;
-/** Minimum ms between AI actions (safety net against noisy vision) */
-let lastActionTime = 0;
 let minActionInterval = 80;
+let lastActionTime = 0;
 
 function applySpeedPreset(preset: SpeedPreset): void {
   speedPreset = preset;
-  switch (preset) {
-    case 'safe':
-      keyDelay = 30;
-      minActionInterval = 150;
-      break;
-    case 'fast':
-      keyDelay = 16;
-      minActionInterval = 80;
-      break;
-    case 'turbo':
-      keyDelay = 4;
-      minActionInterval = 40;
-      break;
+  if (preset === 'safe') {
+    keyDelay = 30; minActionInterval = 150;
+  } else {
+    keyDelay = 16; minActionInterval = 80;
   }
 }
 
-/** Panic tracking: count consecutive decisions where stack is near top. */
 let highStackCount = 0;
 
-// Game hook is injected via manifest.json (world: "MAIN", run_at: "document_start")
-// This guarantees it runs before TETR.IO's scripts, so the getContext patch takes effect.
+// ===== Move dispatch =====
 
-// ===== Execute moves via main world =====
-
-/**
- * Send move sequence to game-hook (main world) for execution.
- * Returns a promise that resolves when the game-hook confirms completion.
- */
 function executeMovesInMainWorld(
   sequence: { hold: boolean; rotations: number; horizontalMoves: number; use180: boolean },
-): Promise<void> {
+): Promise<{ verified: boolean; finalFilled: number; postDropMs: number }> {
   return new Promise(resolve => {
-    // Timeout safety: if game-hook doesn't respond in 5s, resolve anyway
     const timeout = setTimeout(() => {
       window.removeEventListener('message', handler);
-      console.warn('[TETRIO-BOT] Move execution timed out');
-      resolve();
-    }, 5000);
+      console.warn('[TETRIO-BOT] MOVES_COMPLETE wait timed out');
+      resolve({ verified: false, finalFilled: 0, postDropMs: 0 });
+    }, 3000);
 
     const handler = (event: MessageEvent) => {
       if (event.source !== window) return;
       if (event.data?.type === 'MOVES_COMPLETE') {
         clearTimeout(timeout);
         window.removeEventListener('message', handler);
-        resolve();
+        resolve({
+          verified: !!event.data.verified,
+          finalFilled: event.data.finalFilled ?? 0,
+          postDropMs: event.data.postDropMs ?? 0,
+        });
       }
     };
     window.addEventListener('message', handler);
@@ -131,62 +93,41 @@ function executeMovesInMainWorld(
   });
 }
 
-// ===== Game State Handling =====
+// ===== GameState handler =====
 
-window.addEventListener('message', (event) => {
+window.addEventListener('message', event => {
   if (event.source !== window) return;
-
-  if (event.data?.type === 'TETRIO_GAME_STATE') {
-    const state = event.data.state as GameState;
-    const pieceCounter = event.data.pieceCounter as number;
-    const rawBoard = event.data.rawBoard as boolean | undefined;
-    handleGameState(state, pieceCounter, rawBoard ?? false);
-  }
+  if (event.data?.type !== 'TETRIO_GAME_STATE') return;
+  const state = event.data.state as GameState;
+  const pieceCounter = event.data.pieceCounter as number;
+  handleGameState(state, pieceCounter);
 });
 
-async function handleGameState(
-  state: GameState,
-  pieceCounter: number,
-  rawBoard: boolean,
-): Promise<void> {
+async function handleGameState(state: GameState, pieceCounter: number): Promise<void> {
   lastState = state;
-
   if (!isRunning || !state.isPlaying || isExecutingMove) return;
 
-  // Cooldown: prevent rapid-fire actions even if vision is noisy
   const now = Date.now();
   if (now - lastActionTime < minActionInterval) return;
-
-  // Dedup: use monotonic piece counter from game-hook
   if (typeof pieceCounter !== 'number' || pieceCounter <= lastActedPieceCounter) return;
 
   isExecutingMove = true;
-  lastActedPieceCounter = pieceCounter;
   lastActionTime = Date.now();
 
   try {
-    // Clean the raw board: subtract active piece cells at spawn position
-    const board = rawBoard
-      ? cleanRawBoard(
-          state.board,
-          state.currentPiece.type,
-          state.currentPiece.x,
-          state.currentPiece.y,
-        )
-      : state.board;
+    const board = state.board;
+    const filled = countFilled(board);
 
-    // Determine stack height to decide whether to enter survival mode.
+    // Survival heuristic: high stack + many cells => switch to aggressive clearing
     let stackTop = BOARD_TOTAL_HEIGHT;
     for (let row = 0; row < BOARD_TOTAL_HEIGHT; row++) {
       if (board[row].some(c => c !== null)) { stackTop = row; break; }
     }
-    const stackHeight = BOARD_TOTAL_HEIGHT - stackTop;
-    const stackVisibleHeight = Math.max(0, stackHeight - BOARD_HEIGHT_BUFFER);
-    const danger = stackVisibleHeight > 14;
+    const stackVisible = Math.max(0, BOARD_TOTAL_HEIGHT - stackTop - BOARD_HEIGHT_BUFFER);
+    const danger = stackVisible > 10 && filled > 40;
     if (danger) highStackCount++; else highStackCount = 0;
-    const survivalMode = danger || highStackCount >= 3;
+    const survivalMode = danger || highStackCount >= 2;
 
-    // Run AI
     const aiStart = performance.now();
     const decision: AIDecision = findBestPlacement(
       board,
@@ -197,63 +138,98 @@ async function handleGameState(
       {
         weights: getWeightProfile(weightProfile),
         beamWidth: strengthBeamWidth(aiStrength),
-        maxDepth: 6,
+        maxDepth: 5,
         survivalMode,
       },
     );
     const aiMs = performance.now() - aiStart;
 
-    // Determine spawn position based on whether we're using hold
-    const pieceToPlace = decision.useHold
-      ? (state.holdPiece ?? state.nextQueue[0])
-      : state.currentPiece.type;
+    // Compute the "current" state at the moment the executor begins moving.
+    // - No hold: piece is wherever vision detected it.
+    // - Hold:    after the swap, the active piece spawns at standard position
+    //   (x=4 for O, x=3 for everything else).
+    let currentX: number;
+    let currentRot: number;
+    if (decision.useHold) {
+      const pieceToPlace = state.holdPiece ?? state.nextQueue[0];
+      currentX = pieceToPlace === 'O' ? 4 : 3;
+      currentRot = 0;
+    } else {
+      currentX = state.currentPiece.x;
+      currentRot = state.currentPiece.rotation;
+    }
 
-    const spawnState = {
-      type: pieceToPlace,
-      rotation: 0,
-      x: pieceToPlace === 'O' ? 4 : 3,
-      y: 4,
-    };
-
-    // Calculate moves from spawn position to AI target
-    const sequence = calculateMoveSequence(spawnState, decision.placement);
+    const sequence = calculateMoveSequence(
+      {
+        type: decision.placement.type,
+        rotation: currentRot,
+        x: currentX,
+        y: state.currentPiece.y,
+      },
+      decision.placement,
+    );
     sequence.hold = decision.useHold;
 
-    console.log(`[TETRIO-BOT] AI(${aiMs.toFixed(0)}ms queue=${state.nextQueue.length}${survivalMode ? ' SURVIVAL' : ''}): ${decision.useHold ? 'HOLD→' : ''}${pieceToPlace} rot=${decision.placement.rotation} x=${decision.placement.x} y=${decision.placement.y} score=${decision.score.toFixed(1)} moves: h=${sequence.horizontalMoves} r=${sequence.rotations} 180=${sequence.use180}`);
+    console.log(
+      `[TETRIO-BOT] AI(${aiMs.toFixed(0)}ms${survivalMode ? ' SURVIVAL' : ''}) ` +
+      `piece=${decision.placement.type} ` +
+      `${decision.useHold ? 'HOLD→' : ''}rot=${decision.placement.rotation} x=${decision.placement.x} ` +
+      `score=${decision.score.toFixed(1)} moves: h=${sequence.horizontalMoves} r=${sequence.rotations} 180=${sequence.use180}`,
+    );
 
-    // Execute via main world (game-hook dispatches real keyboard events)
-    await executeMovesInMainWorld(sequence);
+    const result = await executeMovesInMainWorld(sequence);
 
-    stats.piecesPlaced++;
+    if (result.verified) {
+      lastActedPieceCounter = pieceCounter;
+      consecutiveUnverified = 0;
+      stats.piecesPlaced++;
+    } else {
+      consecutiveUnverified++;
+      console.warn(
+        `[TETRIO-BOT] Move unverified (${consecutiveUnverified} in a row, ${result.postDropMs.toFixed(0)}ms)`,
+      );
+      if (consecutiveUnverified >= 3) {
+        console.error('[TETRIO-BOT] 3 consecutive unverified moves — pausing bot. Re-start when board is clean.');
+        isRunning = false;
+        chrome.runtime.sendMessage({ type: 'BOT_STATUS', payload: { running: false, error: 'unverified' } })
+          .catch(() => {/* popup closed */});
+      }
+      // Don't advance counter — next vision update will retry
+    }
 
-    // Notify popup of stats
     chrome.runtime.sendMessage({
       type: 'BOT_STATUS',
       payload: {
-        running: true,
+        running: isRunning,
         piecesPlaced: stats.piecesPlaced,
         pps: stats.startTime
           ? stats.piecesPlaced / ((Date.now() - stats.startTime) / 1000)
           : 0,
       },
-    }).catch(() => {/* popup may be closed */});
-
+    }).catch(() => {/* popup closed */});
   } catch (e) {
-    console.error('[TETRIO-BOT] Move execution error:', e);
+    console.error('[TETRIO-BOT] handleGameState error:', e);
   } finally {
     isExecutingMove = false;
   }
 }
 
-// ===== Control Messages =====
+function countFilled(board: GameState['board']): number {
+  let n = 0;
+  for (const row of board) for (const c of row) if (c !== null) n++;
+  return n;
+}
+
+// ===== Control messages =====
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type === 'BOT_START') {
     isRunning = true;
     isExecutingMove = false;
     lastActedPieceCounter = -1;
-    stats = { piecesPlaced: 0, linesCleared: 0, startTime: Date.now() };
+    consecutiveUnverified = 0;
     highStackCount = 0;
+    stats = { piecesPlaced: 0, startTime: Date.now() };
     window.postMessage({ type: 'BOT_START' }, '*');
     console.log('[TETRIO-BOT] Bot started.');
     sendResponse({ ok: true });
@@ -264,11 +240,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     sendResponse({ ok: true });
   } else if (message.type === 'SET_SPEED') {
     const preset = message.payload?.preset;
-    if (preset === 'safe' || preset === 'fast' || preset === 'turbo') {
+    if (preset === 'safe' || preset === 'fast') {
       applySpeedPreset(preset);
-    } else {
-      // Legacy: accept raw keyDelay values
-      keyDelay = message.payload?.keyDelay ?? 16;
     }
     sendResponse({ ok: true });
   } else if (message.type === 'SET_STRENGTH') {
@@ -289,9 +262,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         : 0,
     });
   }
-  return true; // async response
+  return true;
 });
 
-// ===== Init =====
-
-console.log('[TETRIO-BOT] Content script loaded.');
+console.log('[TETRIO-BOT] Content script loaded (v5).');
